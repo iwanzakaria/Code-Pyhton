@@ -7,7 +7,10 @@ Area SELALU direset dan digambar ulang setiap program dijalankan (tidak disimpan
     2) AREA COUNTING MOTOR (HIJAU)
     3) AREA COUNTING MOBIL (MERAH)
 Aturan:
-  * Kendaraan harus lebih dulu menyentuh area KUNING (inisialisasi).
+  * Kendaraan harus lebih dulu menyentuh area KUNING (inisialisasi). Inisialisasi sah bila KAKI/roda (bidang
+    tanah) menyentuh atau melintasi kuning -- termasuk lompatan antar-frame di FPS rendah --, atau bila hanya
+    BADAN yang menyentuh kuning tetapi kendaraan terbukti bergerak maju ke arah hijau/merah. Kendaraan yang
+    kakinya sudah menyentuh hijau/merah SEBELUM kuning (arah balik) tidak dihitung untuk kelas tersebut.
   * Counting tidak memakai bagian dalam/border area sebagai indikator. Motor dihitung saat BADAN kendaraan
     menyentuh/menyeberangi GARIS HIJAU; mobil/bus/truk saat RODA atau BADAN kendaraan
     menyentuh/menyeberangi GARIS MERAH.
@@ -114,6 +117,13 @@ TARGET_CLASSES = [2, 3, 5, 7]  # 2 car, 3 motorcycle, 5 bus, 7 truck
 MIN_TRAVEL_PX = 12              # hanya sebagai filter arah; indikator counting UTAMA adalah sentuhan garis ROI
 MIN_TRACK_FRAMES = 2            # motor yang singkat terlihat tetap bisa diinisialisasi
 MIN_YELLOW_HITS = 1              # satu bukti kontak badan/anchor dengan area kuning sudah cukup
+# Inisialisasi kuning berbasis BIDANG TANAH (kaki/roda), bukan sekadar bbox: bagian atas bbox kendaraan yang
+# berada di belakang/di jalan sebelah sering 'menyentuh' kuning secara perspektif padahal kendaraannya tidak.
+INIT_FOOT_BAND_FRAC = 0.25       # pita kaki = 25% bawah bbox; menyentuh kuning = kontak tanah sah
+INIT_BODY_MIN_HITS = 2           # hanya BADAN yang menyentuh kuning (kaki tidak) -> minimal 2 observasi ...
+INIT_BODY_FWD_PX = 30.0          # ... DAN sudah maju searah kuning -> hijau/merah minimal max(30 px, ...
+INIT_BODY_FWD_RATIO = 0.50       # ... 50% lebar bbox) sejak pertama terlihat (kendaraan keluar dari halangan)
+PRE_TRACK_KEEP_SEC = 3.0         # riwayat deteksi SEBELUM menyentuh kuning disimpan selama ini (detik)
 MIN_CLASS_CONFIRM_FRAMES = 2     # class minimal 2 observasi sebelum counting
 LOST_AFTER = 1.2                 # jangan terlalu cepat melepas track saat inference tidak setiap frame
 RELINK_TIME = 4.5                # pertahankan kandidat lebih lama saat ID ByteTrack berganti
@@ -774,6 +784,89 @@ class TrackState:
         self.park_anchor = None
         self.motion_confirmed = False
         self.park_memory_id = None
+        self.origin_pt = None         # posisi kaki saat pertama terlihat (termasuk riwayat sebelum kuning)
+        self.origin_t = None
+        self.yellow_body_hits = 0     # observasi di mana HANYA badan (bukan kaki) menyentuh kuning
+        self.init_mode = None         # "kaki" / "badan+gerak" -- untuk label debug
+        self.pre_target = set()       # kelas yang kakinya menyentuh hijau/merah SEBELUM kuning (arah balik)
+
+
+def yellow_ground_contact(poly, box, prev_pt, pt):
+    """Titik kaki (koordinat tanah) saat MASUK area kuning, atau None bila hanya badan atas yang menyentuh.
+
+    Lintasan kaki antar-frame diperiksa lebih dulu: di FPS rendah kendaraan bisa melompati area kuning dalam satu
+    langkah, dan titik masuk pada lintasan lebih akurat daripada posisi kaki sekarang."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    if prev_pt is not None:
+        for t in np.linspace(0.0, 1.0, max(2, LINE_CROSS_SAMPLES)):
+            p = (prev_pt[0] + (pt[0] - prev_pt[0]) * t, prev_pt[1] + (pt[1] - prev_pt[1]) * t)
+            if inside(poly, p):
+                return p
+    if any(inside(poly, w) or point_near_poly_boundary(poly, w) for w in wheel_points(x1, x2, y2)):
+        return pt
+    band = (x1, y2 - INIT_FOOT_BAND_FRAC * max(1.0, y2 - y1), x2, y2)
+    if bbox_overlaps_polygon(poly, band):
+        return pt
+    return None
+
+
+def pre_observe(pre, tid, group, pt, box, now, green_roi, red_roi):
+    """Riwayat ringan deteksi yang BELUM punya track (belum menyentuh kuning): posisi, kelas, dan apakah kakinya
+    sudah menyentuh hijau/merah lebih dulu. Dipakai seed_from_pre() saat objek akhirnya menyentuh kuning."""
+    p = pre.get(tid)
+    if p is None:
+        p = {"hist": deque(maxlen=16), "votes": Counter(), "target": set(), "pt": None, "box": None, "wheels": None}
+        pre[tid] = p
+    wheels = wheel_points(float(box[0]), float(box[2]), float(box[3]))
+    for g_name, g_roi in (("motor", green_roi), ("car", red_roi)):
+        if any(inside(g_roi, w) for w in wheels) or (p["pt"] is not None and segment_hits(g_roi, p["pt"], pt)):
+            p["target"].add(g_name)
+    p["hist"].append((now, float(pt[0]), float(pt[1])))
+    p["votes"][group] += 1
+    p["pt"], p["box"], p["wheels"], p["t"] = pt, tuple(float(v) for v in box), wheels, now
+
+
+def seed_from_pre(st, p):
+    """Track baru mewarisi riwayat sebelum kuning: lintasan kaki masuk kuning bisa dihitung dari posisi sebelumnya
+    (FPS rendah), gerak/arah punya sampel lebih banyak, dan observasi sebelumnya ikut memenuhi MIN_TRACK_FRAMES."""
+    if not p or not p["hist"]:
+        return
+    st.hist.extend(p["hist"])
+    st.votes.update(p["votes"])
+    st.last_pt, st.last_box, st.last_wheels = p["pt"], p["box"], p["wheels"]
+    t0, x0, y0 = p["hist"][0]
+    st.origin_pt, st.origin_t = (x0, y0), t0
+    st.frames = 1
+    st.pre_target = set(p["target"])
+
+
+def update_yellow_init(st, pt, box, prev_pt, prev_box, now, yellow_roi, entry_dirs, group):
+    """Catat bukti kontak kuning. Return True bila objek kini punya titik masuk kuning yang SAH:
+    (a) kaki/roda/pita bawah bbox menyentuh kuning, atau lintasan kaki antar-frame melewatinya; ATAU
+    (b) hanya badan yang menyentuh kuning >= INIT_BODY_MIN_HITS kali DAN objek sudah maju searah kuning -> target."""
+    if st.origin_pt is None:
+        st.origin_pt, st.origin_t = (float(pt[0]), float(pt[1])), now
+    yellow_hit, _ = touches_bbox(yellow_roi, box, prev_box)
+    if yellow_hit:
+        st.yellow_hits += 1
+        if st.yellow_foot_pt is None:
+            contact = yellow_ground_contact(yellow_roi, box, prev_pt, pt)
+            if contact is not None:
+                st.yellow_pt = st.yellow_foot_pt = (float(contact[0]), float(contact[1]))
+                st.yellow_foot_t = now
+                st.init_mode = "kaki"
+            else:
+                st.yellow_body_hits += 1
+    if st.yellow_foot_pt is None and st.yellow_body_hits >= INIT_BODY_MIN_HITS and not st.parked:
+        g = st.votes.most_common(1)[0][0] if st.votes else group
+        bw = max(1.0, float(box[2]) - float(box[0]))
+        d = entry_dirs[g]
+        fwd = (pt[0] - st.origin_pt[0]) * float(d[0]) + (pt[1] - st.origin_pt[1]) * float(d[1])
+        if fwd >= max(INIT_BODY_FWD_PX, INIT_BODY_FWD_RATIO * bw):
+            st.yellow_pt = st.yellow_foot_pt = st.origin_pt
+            st.yellow_foot_t = st.origin_t
+            st.init_mode = "badan+gerak"
+    return st.yellow_foot_pt is not None
 
 
 def _box_center(box):
@@ -1901,6 +1994,7 @@ def run(frame_queue, counts, truth, session):
     tracks, lost = {}, {}
     counted_ids = set()   # ID yang sudah terhitung (tidak akan dihitung lagi)
     park_memory = []      # lokasi kendaraan parkir persisten, independen dari ID ByteTrack
+    pre = {}              # riwayat deteksi yang belum menyentuh kuning (lihat pre_observe)
     total_init = 0
     fps, prev_t = 0.0, time.time()
     last_summary, last_written = time.time(), (0, 0)
@@ -1943,6 +2037,7 @@ def run(frame_queue, counts, truth, session):
                 lost.clear()
                 counted_ids.clear()
                 park_memory.clear()
+                pre.clear()
                 last_written = (0, 0)
                 current_day = today
                 print(f"[INFO] Tanggal berganti ke {today} -> semua hitungan (mobil/motor) direset ke 0.")
@@ -1971,19 +2066,28 @@ def run(frame_queue, counts, truth, session):
                     # area KUNING. Namun sebelum menolak objek di luar kuning, coba relink dulu:
                     # bila ini sebenarnya kendaraan lama yang baru mendapat ID berbeda setelah keluar
                     # dari kuning, track harus tetap dilanjutkan sampai zona counting.
-                    yellow_hit_new, yellow_anchor_new = touches_bbox(yellow_roi, box)
+                    # bbox sebelumnya (riwayat pra-kuning) ikut dipakai: di FPS rendah kendaraan bisa melompati
+                    # area kuning di antara dua deteksi tanpa bbox-nya pernah tepat berada di atas kuning.
+                    p_prev = pre.get(tid)
+                    yellow_hit_new, yellow_anchor_new = touches_bbox(
+                        yellow_roi, box, p_prev["box"] if p_prev is not None else None)
                     if st is None:
                         st = lost.pop(tid, None)                       # ID lama muncul kembali
                         if st is None:
                             old = find_relink(lost, pt, group, now)    # ID baru dari track lama
                             st = lost.pop(old) if old is not None else None
 
-                        # Belum punya track lama dan belum menyentuh kuning -> jangan buat state baru.
+                        # Belum punya track lama dan belum menyentuh kuning -> jangan buat state baru,
+                        # tetapi simpan riwayatnya (posisi sebelum kuning = bukti arah objek -> kuning).
                         if st is None and not yellow_hit_new:
+                            pre_observe(pre, tid, group, pt, box, now, green_roi, red_roi)
                             continue
 
                         if st is None:
                             st = TrackState(now)
+                            seed_from_pre(st, pre.pop(tid, None))
+                        else:
+                            pre.pop(tid, None)
                         tracks[tid] = st
                         if tid in counted_ids:
                             st.counted = True          # ID yang sudah pernah terhitung tidak dihitung lagi
@@ -2008,20 +2112,14 @@ def run(frame_queue, counts, truth, session):
                     prev_pt = st.last_pt
                     prev_box = st.last_box
 
-                    # --- Inisialisasi (kuning): pakai BADAN kendaraan + segment antar-frame ---
-                    yellow_hit, yellow_anchor = touches_bbox(yellow_roi, box, prev_box)
-                    if yellow_hit:
-                        st.yellow_hits += 1
-                        contact_pt = yellow_anchor if yellow_anchor is not None else pt
-                        if st.yellow_pt is None:
-                            st.yellow_pt = contact_pt
-                        if getattr(st, "yellow_foot_pt", None) is None:
-                            st.yellow_foot_pt = contact_pt
-                            st.yellow_foot_t = now
+                    # --- Inisialisasi (kuning): kontak KAKI/tanah, atau badan + gerak maju (lihat update_yellow_init) ---
+                    # Titik masuk disimpan dalam koordinat KAKI agar jarak tempuh (pt - yellow_pt) tidak bias;
+                    # dulu titiknya bisa berupa anchor di tengah badan sehingga 'travel' melenceng ~0.6 x tinggi bbox.
+                    yellow_ok = update_yellow_init(st, pt, box, prev_pt, prev_box, now, yellow_roi, entry_dirs, group)
 
-                    # Inisialisasi lebih cepat untuk motor, tetapi tetap harus punya minimal 2 observasi
-                    # track sehingga deteksi satu-frame yang kebetulan muncul di kuning tidak langsung sah.
-                    if (not st.initialized and st.yellow_pt is not None
+                    # Tetap harus punya minimal 2 observasi (riwayat pra-kuning ikut dihitung) dan tidak sedang
+                    # parkir, sehingga deteksi satu-frame / kendaraan diam di kuning tidak langsung sah.
+                    if (not st.initialized and yellow_ok and not st.parked
                             and st.frames >= MIN_TRACK_FRAMES
                             and st.yellow_hits >= MIN_YELLOW_HITS):
                         st.initialized = True
@@ -2062,7 +2160,9 @@ def run(frame_queue, counts, truth, session):
                             target_roi, box, prev_box=prev_box,
                             wheels=wheels, prev_wheels=st.last_wheels
                         )
-                        if hit:
+                        # Kaki sudah menyentuh area counting kelas ini SEBELUM kuning -> arah balik, bukan
+                        # urutan objek -> kuning -> hijau/merah.
+                        if hit and cur_group not in st.pre_target:
                             # Travel hanya menjadi filter arah minimum. Kendaraan TIDAK harus masuk
                             # ke dalam area polygon; menyentuh garis sudah cukup sebagai trigger.
                             travel = float(np.dot((pt[0] - st.yellow_pt[0], pt[1] - st.yellow_pt[1]),
@@ -2084,6 +2184,8 @@ def run(frame_queue, counts, truth, session):
                         if debug and st.parked:
                             color = (255, 128, 0)
                         label_extra = " PARKIR" if (debug and st.parked) else (" GERAK" if debug and st.motion_confirmed else "")
+                        if debug:
+                            label_extra += f" INIT:{st.init_mode}" if st.initialized else " belum-init"
                         cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                         cv2.putText(vis, f"#{tid} {LABEL[group]} {conf:.2f}{label_extra}", (int(x1), int(y1) - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -2100,13 +2202,15 @@ def run(frame_queue, counts, truth, session):
                 st = tracks[tid]
                 if tid not in seen and now - st.last_seen > LOST_AFTER:
                     del tracks[tid]
-                    if st.yellow_pt is not None:
+                    if st.yellow_hits > 0:
                         lost[tid] = st
             for tid in list(lost):
                 st = lost[tid]
                 if now - st.last_seen > RELINK_TIME:
                     # Track yang terlalu lama hilang dibuang dari daftar relink.
                     del lost[tid]
+            for tid in [k for k, p in pre.items() if now - p["t"] > PRE_TRACK_KEEP_SEC]:
+                del pre[tid]
 
             pending = sum(1 for t in seen if t in tracks and tracks[t].initialized and not tracks[t].counted
                           and not tracks[t].parked and tracks[t].motion_confirmed)
@@ -2156,6 +2260,7 @@ def run(frame_queue, counts, truth, session):
                     yellow_roi, green_roi, red_roi, entry_dirs = build_zones(roi)
                     tracks.clear()
                     lost.clear()
+                    pre.clear()
                 prev_t = time.time()
     finally:
         # Tunggu semua tulisan yg masih di antrean selesai dulu, baru tutup thread-nya dgn rapi.
